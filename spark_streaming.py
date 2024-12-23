@@ -4,44 +4,13 @@ from pyspark.sql.types import *
 import pyspark.sql.functions as F
 import os
 import logging
-import numpy as np
-import tensorflow as tf
-import joblib
-from tensorflow.keras.models import load_model
+from ml_pipeline import AnomalyDetectionPipeline
+import pandas as pd
+from datetime import datetime
 
-# Set up logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Update the model loading in the AnomalyDetector class initialization
-class AnomalyDetector:
-    def __init__(self, sequence_length=10):
-        self.sequence_length = sequence_length
-        self.scaler = joblib.load('models/scaler.joblib')
-        self.isolation_forest = joblib.load('models/isolation_forest.joblib')
-        self.lstm_autoencoder = load_model('models/lstm_autoencoder.keras')
-	
-    def create_sequence(self, value):
-        # This is a simplified version for streaming - you'll need to maintain state
-        # in a real application to create proper sequences
-        return np.array([[value] * self.sequence_length])
-    
-    def detect_anomaly(self, value):
-        # Scale the value
-        scaled_value = self.scaler.transform([[value]])[0][0]
-        
-        # Isolation Forest detection
-        if_prediction = self.isolation_forest.predict([[scaled_value]])[0]
-        if_anomaly = if_prediction == -1
-        
-        # LSTM Autoencoder detection
-        sequence = self.create_sequence(scaled_value)
-        reconstruction = self.lstm_autoencoder.predict(sequence)
-        reconstruction_error = np.mean(np.abs(sequence - reconstruction))
-        lstm_anomaly = reconstruction_error > 0.5  # Threshold can be adjusted
-        
-        # Combine predictions (consider it an anomaly if either model detects it)
-        return bool(if_anomaly or lstm_anomaly), float(reconstruction_error)
 
 def create_spark_session():
     try:
@@ -57,56 +26,58 @@ def create_spark_session():
         logger.error(f"Failed to create Spark session: {str(e)}")
         raise
 
-def define_schema():
-    return StructType([
-        StructField("timestamp", TimestampType(), True),
-        StructField("value", DoubleType(), True)
-    ])
-
-# Initialize anomaly detector
-detector = AnomalyDetector()
-
-# Create UDF for anomaly detection
-@udf(StructType([
-    StructField("is_anomaly", BooleanType(), True),
-    StructField("reconstruction_error", DoubleType(), True)
-]))
-def detect_anomaly_udf(value):
-    if value is None:
-        return (False, 0.0)
+def process_batch(batch_df, epoch_id, pipeline):
     try:
-        is_anomaly, reconstruction_error = detector.detect_anomaly(float(value))
-        return (bool(is_anomaly), float(reconstruction_error))
-    except Exception as e:
-        logger.error(f"Error in anomaly detection: {str(e)}")
-        return (False, 0.0)
+        if batch_df.isEmpty():
+            return
+            
 
-def process_stream(df):
-    return df \
-        .withColumn(
-            "ml_detection",
-            detect_anomaly_udf("value")
-        ) \
-        .select(
-            "timestamp",
-            "value",
-            col("ml_detection.is_anomaly").alias("is_anomaly"),
-            col("ml_detection.reconstruction_error").alias("reconstruction_error")
-        )
+        pandas_df = batch_df.toPandas()
+        
+
+        if 'timestamp' in pandas_df.columns:
+
+            pandas_df['timestamp'] = pd.to_datetime(pandas_df['timestamp'], errors='coerce')
+            
+
+            pandas_df['timestamp'] = pandas_df['timestamp'].astype('datetime64[ns]')
+        
+
+        results = pipeline.detect_anomalies(pandas_df)
+        
+
+        logger.info(f"Batch {epoch_id}: Processed {len(results)} records")
+        return results
+    except Exception as e:
+        logger.error(f"Error processing batch {epoch_id}: {str(e)}")
+        logger.error(f"DataFrame columns: {batch_df.columns}")
+        logger.error(f"DataFrame schema: {batch_df.schema}")
+        raise
 
 def main():
     spark = None
     try:
-        # Create Spark session
+
         logger.info("Creating Spark session...")
         spark = create_spark_session()
+
+
+        logger.info("Initializing ML pipeline...")
+        pipeline = AnomalyDetectionPipeline()
         
-        # Ensure checkpoint directory exists
+
+        if os.path.exists('models'):
+            pipeline.load_models('models')
+        else:
+            logger.warning("No trained models found. Please run train_models.py first.")
+            return
+
+
         checkpoint_dir = "/tmp/spark-checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
-        
-        logger.info("Reading from Kafka...")
-        # Read from Kafka
+
+
+        logger.info("Setting up Kafka stream...")
         input_df = spark \
             .readStream \
             .format("kafka") \
@@ -114,46 +85,44 @@ def main():
             .option("subscribe", "input_data") \
             .option("startingOffsets", "latest") \
             .load()
-        
-        # Parse JSON data
-        schema = define_schema()
+
+
+        schema = StructType([
+            StructField("timestamp", StringType(), True),
+            StructField("value", DoubleType(), True)
+        ])
+
+
         parsed_df = input_df \
             .select(from_json(
                 col("value").cast("string"),
                 schema
             ).alias("data")) \
-            .select("data.*")
-        
-        logger.info("Processing stream with ML models...")
-        # Process stream with ML models
-        output_df = process_stream(parsed_df)
-        
-        logger.info("Starting console output stream...")
-        # Write results to console for debugging
-        console_query = output_df \
+            .select("data.*") \
+            .withColumn("timestamp", 
+                when(
+                    to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss").isNotNull(),
+                    to_timestamp(col("timestamp"), "yyyy-MM-dd HH:mm:ss")
+                ).when(
+                    to_timestamp(col("timestamp"), "yyyy-MM-dd'T'HH:mm:ss").isNotNull(),
+                    to_timestamp(col("timestamp"), "yyyy-MM-dd'T'HH:mm:ss")
+                ).otherwise(
+                    lit(None).cast("timestamp")
+                )
+            )
+
+
+        query = parsed_df \
             .writeStream \
-            .outputMode("append") \
-            .format("console") \
-            .option("truncate", "false") \
+            .foreachBatch(lambda df, epoch_id: process_batch(df, epoch_id, pipeline)) \
+            .outputMode("update") \
             .start()
-        
-        logger.info("Starting Kafka output stream...")
-        # Write results back to Kafka
-        kafka_query = output_df \
-            .select(to_json(struct("*")).alias("value")) \
-            .writeStream \
-            .outputMode("append") \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("topic", "anomalies") \
-            .option("checkpointLocation", os.path.join(checkpoint_dir, "kafka")) \
-            .start()
-        
-        logger.info("Waiting for termination...")
-        spark.streams.awaitAnyTermination()
-        
+
+        logger.info("Streaming query started. Waiting for termination...")
+        query.awaitTermination()
+
     except Exception as e:
-        logger.error(f"Error in Spark Streaming: {str(e)}")
+        logger.error(f"Error in main: {str(e)}")
         raise
     finally:
         if spark:

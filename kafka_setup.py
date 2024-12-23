@@ -3,8 +3,9 @@ import json
 import time
 import pandas as pd
 from datetime import datetime
+import threading
 
-# Kafka Producer
+
 class DataProducer:
     def __init__(self, bootstrap_servers='localhost:9092'):
         self.producer = Producer({
@@ -32,7 +33,7 @@ class DataProducer:
     def close(self):
         self.producer.flush()
 
-# Kafka Consumer
+
 class DataConsumer:
     def __init__(self, topics, group_id='python-consumer', bootstrap_servers='localhost:9092'):
         self.consumer = Consumer({
@@ -51,7 +52,6 @@ class DataConsumer:
                 if msg.error():
                     print(f"Consumer error: {msg.error()}")
                     continue
-                
                 try:
                     data = json.loads(msg.value().decode('utf-8'))
                     print(f"Received: {data}")
@@ -62,40 +62,58 @@ class DataConsumer:
         finally:
             self.consumer.close()
 
+
 def simulate_real_time_data(csv_file, producer):
     try:
+        # Read the CSV file
         df = pd.read_csv(csv_file)
         
+
+        if 'timestamp' in df.columns:
+
+            df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
+            
+
+            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+            
         for _, row in df.iterrows():
+
+            timestamp_str = None
+            if pd.notnull(row['timestamp']):
+
+                timestamp_str = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            
             data = {
-                'timestamp': str(row['timestamp']),
-                'value': float(row['value'])
+                'timestamp': timestamp_str,
+                'value': float(row['value']) if 'value' in row and pd.notnull(row['value']) else None
             }
             producer.send_data('input_data', data)
-            time.sleep(1)  # Simulate real-time data by waiting 1 second between messages
+            time.sleep(1)  
+            
     except Exception as e:
         print(f"Error in data simulation: {e}")
+
+        print(f"DataFrame dtypes: {df.dtypes}")
+        print(f"Timestamp column sample: {df['timestamp'].head()}")
+        raise
     finally:
         producer.close()
-
 if __name__ == "__main__":
     try:
-        # Start producer
+
         producer = DataProducer()
         
-        # Start consumer
+
         consumer = DataConsumer(['input_data', 'anomalies'])
         
-        # Run simulation in a separate thread
-        import threading
+
         simulation_thread = threading.Thread(
             target=simulate_real_time_data,
             args=('processed_data.csv', producer)
         )
         simulation_thread.start()
         
-        # Start consuming messages
+
         consumer.consume_messages()
-        
     except Exception as e:
         print(f"Error in main: {e}")

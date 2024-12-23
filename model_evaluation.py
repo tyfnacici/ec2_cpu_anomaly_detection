@@ -1,172 +1,163 @@
 import pandas as pd
 import numpy as np
-from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tensorflow.keras.models import load_model
-import joblib
-import json
+from ml_pipeline import AnomalyDetectionPipeline
+import logging
 import os
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score, f1_score
+import json
+from typing import Tuple, Dict, Any
+from datetime import datetime, timedelta
 
-    
-class ModelEvaluator:
-    def __init__(self, sequence_length=10):
-        self.sequence_length = sequence_length
-        self.scaler = joblib.load('models/scaler.joblib')
-        self.isolation_forest = joblib.load('models/isolation_forest.joblib')
-        self.lstm_autoencoder = load_model('models/lstm_autoencoder.keras')  # Updated extension
-        self.reconstruction_threshold = np.load('models/reconstruction_threshold.npy')
- 
-    def create_sequences(self, data):
-        sequences = []
-        for i in range(len(data) - self.sequence_length + 1):
-            sequences.append(data[i:i + self.sequence_length])
-        return np.array(sequences)
-    
-    def detect_anomalies_isolation_forest(self, data):
-        scaled_data = self.scaler.transform(data.reshape(-1, 1))
-        predictions = self.isolation_forest.predict(scaled_data)
-        return predictions == -1
-    
-    def detect_anomalies_lstm(self, data, threshold=None):
-        if threshold is None:
-            threshold = self.reconstruction_threshold
-        
-        scaled_data = self.scaler.transform(data.reshape(-1, 1))
-        sequences = self.create_sequences(scaled_data)
-        reconstructions = self.lstm_autoencoder.predict(sequences)
-        mse = np.mean(np.square(sequences - reconstructions), axis=(1, 2))
-        return mse > threshold   
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
- 
-    def evaluate_models(self, data, true_anomalies=None):
-        # If no true anomalies provided, create synthetic ones based on statistical methods
-        if true_anomalies is None:
-            mean = np.mean(data)
-            std = np.std(data)
-            true_anomalies = np.abs(data - mean) > 3 * std
+def prepare_sequences(data: np.ndarray, sequence_length: int = 10) -> np.ndarray:
+    """
+    Create sequences for LSTM processing
+    """
+    sequences = []
+    for i in range(len(data) - sequence_length + 1):
+        sequences.append(data[i:i + sequence_length])
+    return np.array(sequences)
+
+def prepare_data_for_evaluation(data: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """
+    Prepare data and create synthetic anomaly labels for evaluation
+    """
+
+    if 'value' not in data.columns:
+        if len(data.columns) == 1:
+            data = data.rename(columns={data.columns[0]: 'value'})
+        else:
+            raise ValueError("Data must contain a 'value' column")
+    
+
+    numeric_data = pd.to_numeric(data['value'], errors='coerce')
+    
+
+    if 'timestamp' not in data.columns:
+        logger.info("Creating synthetic timestamp column...")
+        base_timestamp = datetime.now()
+        timestamps = [base_timestamp + timedelta(hours=i) for i in range(len(numeric_data))]
+        data['timestamp'] = timestamps
+    else:
+        data['timestamp'] = pd.to_datetime(data['timestamp'])
+    
+
+    data = data.dropna(subset=['value'])
+    values = data['value'].values.reshape(-1, 1)
+    
+
+    mean = np.mean(values)
+    std = np.std(values)
+    true_anomalies = np.abs(values - mean) > 3 * std
+    
+    return values, true_anomalies, data[['timestamp', 'value']]
+
+def calculate_metrics(true_anomalies: np.ndarray, predictions: np.ndarray) -> Dict[str, float]:
+    """
+    Calculate evaluation metrics
+    """
+    return {
+        'precision': float(precision_score(true_anomalies, predictions)),
+        'recall': float(recall_score(true_anomalies, predictions)),
+        'f1': float(f1_score(true_anomalies, predictions))
+    }
+
+def evaluate_models(data_path: str = 'your_data.csv', models_dir: str = 'models') -> Dict[str, Any]:
+    """
+    Evaluate trained anomaly detection models using test data
+    """
+    try:
+
+        logger.info("Loading test data...")
+        data = pd.read_csv(data_path)
         
-        # Get predictions from both models
-        if_predictions = self.detect_anomalies_isolation_forest(data)
-        lstm_predictions = self.detect_anomalies_lstm(data)
+        logger.info("Preparing data for evaluation...")
+        if data.empty:
+            raise ValueError("The loaded data is empty")
+            
+
+        values, true_anomalies, processed_df = prepare_data_for_evaluation(data)
         
-        # Adjust lengths to match
-        min_length = min(len(true_anomalies[self.sequence_length-1:]), 
-                        len(if_predictions[self.sequence_length-1:]),
-                        len(lstm_predictions))
+
+        logger.info("Loading trained models...")
+        pipeline = AnomalyDetectionPipeline()
+        pipeline.load_models(models_dir)
         
-        true_anomalies = true_anomalies[self.sequence_length-1:self.sequence_length-1+min_length]
-        if_predictions = if_predictions[self.sequence_length-1:self.sequence_length-1+min_length]
+
+        logger.info("Processing data and generating predictions...")
+        processed_data = pipeline.preprocess_data(processed_df)
+        
+
+        logger.info("Detecting anomalies with Isolation Forest...")
+        if_predictions = (pipeline.isolation_forest.predict(processed_data) == -1)
+        
+
+        logger.info("Detecting anomalies with LSTM...")
+
+        sequences = prepare_sequences(processed_data)
+        lstm_reconstructions = pipeline.lstm_model.predict(sequences)
+        reconstruction_errors = np.mean(np.square(sequences - lstm_reconstructions), axis=(1, 2))
+        lstm_predictions = reconstruction_errors > pipeline.reconstruction_threshold
+        
+
+        min_length = min(len(true_anomalies), len(if_predictions), len(lstm_predictions))
+        true_anomalies = true_anomalies[:min_length]
+        if_predictions = if_predictions[:min_length]
         lstm_predictions = lstm_predictions[:min_length]
         
-        # Calculate metrics for Isolation Forest
-        if_metrics = {
-            'precision': float(precision_score(true_anomalies, if_predictions)),
-            'recall': float(recall_score(true_anomalies, if_predictions)),
-            'f1': float(f1_score(true_anomalies, if_predictions))
+
+        metrics = {
+            'isolation_forest': calculate_metrics(true_anomalies.ravel(), if_predictions),
+            'lstm': calculate_metrics(true_anomalies.ravel(), lstm_predictions)
         }
         
-        # Calculate metrics for LSTM Autoencoder
-        lstm_metrics = {
-            'precision': float(precision_score(true_anomalies, lstm_predictions)),
-            'recall': float(recall_score(true_anomalies, lstm_predictions)),
-            'f1': float(f1_score(true_anomalies, lstm_predictions))
-        }
+
+        os.makedirs('evaluation_results', exist_ok=True)
         
-        return {
-            'isolation_forest': if_metrics,
-            'lstm_autoencoder': lstm_metrics,
-            'predictions': {
-                'isolation_forest': if_predictions.tolist(),
-                'lstm_autoencoder': lstm_predictions.tolist(),
-                'true_anomalies': true_anomalies.tolist()
-            }
-        }
-    
-    def plot_results(self, data, evaluation_results, save_path='evaluation_results'):
-        """Plot and save visualization of results"""
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        
-        # Plot 1: Time series with anomalies
+
         plt.figure(figsize=(15, 8))
-        plt.plot(data, label='Original Data', alpha=0.5)
+        plt.plot(processed_df['timestamp'][:min_length], values[:min_length], 
+                label='Original Data', alpha=0.5)
         
-        # Plot anomalies detected by each model
-        if_anomalies = np.array(evaluation_results['predictions']['isolation_forest'])
-        lstm_anomalies = np.array(evaluation_results['predictions']['lstm_autoencoder'])
-        
-        if len(if_anomalies) > 0:
-            plt.scatter(np.where(if_anomalies)[0], 
-                       data[np.where(if_anomalies)[0]], 
+
+        if np.any(if_predictions):
+            anomaly_idx = np.where(if_predictions)[0]
+            plt.scatter(processed_df['timestamp'].iloc[anomaly_idx], 
+                       values[anomaly_idx], 
                        color='red', 
                        label='Isolation Forest Anomalies')
         
-        if len(lstm_anomalies) > 0:
-            plt.scatter(np.where(lstm_anomalies)[0], 
-                       data[np.where(lstm_anomalies)[0]], 
+
+        if np.any(lstm_predictions):
+            anomaly_idx = np.where(lstm_predictions)[0]
+            plt.scatter(processed_df['timestamp'].iloc[anomaly_idx], 
+                       values[anomaly_idx], 
                        color='green', 
-                       label='LSTM Autoencoder Anomalies')
+                       label='LSTM Anomalies')
         
         plt.title('Anomaly Detection Results')
         plt.legend()
-        plt.savefig(f'{save_path}/anomaly_detection_results.png')
-        plt.close()
-        
-        # Plot 2: Confusion matrices
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # Isolation Forest confusion matrix
-        cm_if = confusion_matrix(
-            evaluation_results['predictions']['true_anomalies'],
-            evaluation_results['predictions']['isolation_forest']
-        )
-        sns.heatmap(cm_if, annot=True, fmt='d', ax=ax1)
-        ax1.set_title('Isolation Forest Confusion Matrix')
-        
-        # LSTM Autoencoder confusion matrix
-        cm_lstm = confusion_matrix(
-            evaluation_results['predictions']['true_anomalies'],
-            evaluation_results['predictions']['lstm_autoencoder']
-        )
-        sns.heatmap(cm_lstm, annot=True, fmt='d', ax=ax2)
-        ax2.set_title('LSTM Autoencoder Confusion Matrix')
-        
+        plt.xticks(rotation=45)
         plt.tight_layout()
-        plt.savefig(f'{save_path}/confusion_matrices.png')
+        plt.savefig('evaluation_results/anomaly_detection_results.png')
         plt.close()
         
-        # Save metrics to JSON
-        with open(f'{save_path}/metrics.json', 'w') as f:
-            json.dump({
-                'isolation_forest': evaluation_results['isolation_forest'],
-                'lstm_autoencoder': evaluation_results['lstm_autoencoder']
-            }, f, indent=4)
 
-def main():
-    try:
-        # Load your data
-        df = pd.read_csv('your_data.csv')
-        data = df['value'].values
+        with open('evaluation_results/metrics.json', 'w') as f:
+            json.dump(metrics, f, indent=4)
         
-        # Initialize evaluator
-        evaluator = ModelEvaluator()
+        logger.info("Evaluation completed successfully!")
+        logger.info("\nModel Metrics:")
+        logger.info(json.dumps(metrics, indent=2))
         
-        # Evaluate models
-        evaluation_results = evaluator.evaluate_models(data)
-        
-        # Plot and save results
-        evaluator.plot_results(data, evaluation_results)
-        
-        # Print results
-        print("\nIsolation Forest Metrics:")
-        print(json.dumps(evaluation_results['isolation_forest'], indent=2))
-        print("\nLSTM Autoencoder Metrics:")
-        print(json.dumps(evaluation_results['lstm_autoencoder'], indent=2))
+        return metrics
         
     except Exception as e:
-        print(f"Error during model evaluation: {str(e)}")
+        logger.error(f"Error during model evaluation: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    main()
+    evaluate_models()
