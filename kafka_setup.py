@@ -1,10 +1,10 @@
+# kafka_setup.py
 from confluent_kafka import Producer, Consumer
 import json
 import time
 import pandas as pd
 from datetime import datetime
 import threading
-
 
 class DataProducer:
     def __init__(self, bootstrap_servers='localhost:9092'):
@@ -32,7 +32,6 @@ class DataProducer:
 
     def close(self):
         self.producer.flush()
-
 
 class DataConsumer:
     def __init__(self, topics, group_id='python-consumer', bootstrap_servers='localhost:9092'):
@@ -62,25 +61,17 @@ class DataConsumer:
         finally:
             self.consumer.close()
 
-
 def simulate_real_time_data(csv_file, producer):
     try:
-        # Read the CSV file
         df = pd.read_csv(csv_file)
         
-
         if 'timestamp' in df.columns:
-
             df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed', errors='coerce')
-            
-
             df['timestamp'] = df['timestamp'].dt.tz_localize(None)
             
         for _, row in df.iterrows():
-
             timestamp_str = None
             if pd.notnull(row['timestamp']):
-
                 timestamp_str = row['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
             
             data = {
@@ -88,32 +79,27 @@ def simulate_real_time_data(csv_file, producer):
                 'value': float(row['value']) if 'value' in row and pd.notnull(row['value']) else None
             }
             producer.send_data('input_data', data)
-            time.sleep(1)  
+            time.sleep(1)
             
     except Exception as e:
         print(f"Error in data simulation: {e}")
-
         print(f"DataFrame dtypes: {df.dtypes}")
         print(f"Timestamp column sample: {df['timestamp'].head()}")
         raise
     finally:
         producer.close()
+
 if __name__ == "__main__":
     try:
-
         producer = DataProducer()
-        
-
         consumer = DataConsumer(['input_data', 'anomalies'])
         
-
         simulation_thread = threading.Thread(
             target=simulate_real_time_data,
             args=('processed_data.csv', producer)
         )
         simulation_thread.start()
         
-
         consumer.consume_messages()
     except Exception as e:
         print(f"Error in main: {e}")

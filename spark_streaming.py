@@ -8,7 +8,6 @@ from ml_pipeline import AnomalyDetectionPipeline
 import pandas as pd
 from datetime import datetime
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -30,22 +29,15 @@ def process_batch(batch_df, epoch_id, pipeline):
     try:
         if batch_df.isEmpty():
             return
-            
-
+        
         pandas_df = batch_df.toPandas()
         
-
         if 'timestamp' in pandas_df.columns:
-
             pandas_df['timestamp'] = pd.to_datetime(pandas_df['timestamp'], errors='coerce')
-            
-
             pandas_df['timestamp'] = pandas_df['timestamp'].astype('datetime64[ns]')
         
-
         results = pipeline.detect_anomalies(pandas_df)
         
-
         logger.info(f"Batch {epoch_id}: Processed {len(results)} records")
         return results
     except Exception as e:
@@ -57,25 +49,20 @@ def process_batch(batch_df, epoch_id, pipeline):
 def main():
     spark = None
     try:
-
         logger.info("Creating Spark session...")
         spark = create_spark_session()
-
 
         logger.info("Initializing ML pipeline...")
         pipeline = AnomalyDetectionPipeline()
         
-
         if os.path.exists('models'):
             pipeline.load_models('models')
         else:
             logger.warning("No trained models found. Please run train_models.py first.")
             return
 
-
         checkpoint_dir = "/tmp/spark-checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
-
 
         logger.info("Setting up Kafka stream...")
         input_df = spark \
@@ -86,12 +73,10 @@ def main():
             .option("startingOffsets", "latest") \
             .load()
 
-
         schema = StructType([
             StructField("timestamp", StringType(), True),
             StructField("value", DoubleType(), True)
         ])
-
 
         parsed_df = input_df \
             .select(from_json(
@@ -110,7 +95,6 @@ def main():
                     lit(None).cast("timestamp")
                 )
             )
-
 
         query = parsed_df \
             .writeStream \
